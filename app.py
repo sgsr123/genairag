@@ -31,15 +31,24 @@ if missing_vars:
 
 # OAuth Setup
 oauth = OAuth(app)
+
+# Clean and validate credentials
+client_id = required_env_vars['GOOGLE_CLIENT_ID'].strip()
+client_secret = required_env_vars['GOOGLE_CLIENT_SECRET'].strip()
+
+print("Validating OAuth credentials...")
+print(f"Client ID length: {len(client_id)}")
+print(f"Client ID ends with correct suffix: {client_id.endswith('.apps.googleusercontent.com')}")
+
 google = oauth.register(
     name='google',
-    client_id=required_env_vars['GOOGLE_CLIENT_ID'],
-    client_secret=required_env_vars['GOOGLE_CLIENT_SECRET'],
+    client_id=client_id,
+    client_secret=client_secret,
     access_token_url='https://oauth2.googleapis.com/token',
     access_token_params=None,
     authorize_url='https://accounts.google.com/o/oauth2/v2/auth',
     authorize_params={
-        'prompt': 'select_account',
+        'prompt': 'consent',
         'access_type': 'offline',
         'response_type': 'code'
     },
@@ -50,6 +59,11 @@ google = oauth.register(
     },
     server_metadata_url='https://accounts.google.com/.well-known/openid-configuration'
 )
+
+# Print OAuth configuration for debugging (excluding secret)
+print("OAuth Configuration:")
+print(f"Client ID: {client_id}")
+print(f"Redirect URI will be set dynamically")
 
 # Login manager setup
 login_manager = LoginManager()
@@ -170,17 +184,26 @@ def login():
 def google_login():
     """Initiate Google OAuth login."""
     try:
-        redirect_uri = url_for('google_authorize', _external=True)
-        print(f"Redirect URI: {redirect_uri}")  # Debug print
-        session['oauth_redirect_uri'] = redirect_uri
+        # Force external URL to use port 8080
+        redirect_uri = url_for('google_authorize', _external=True, _scheme='http', _port=8080)
+        print(f"Starting Google OAuth flow...")
+        print(f"Redirect URI: {redirect_uri}")
         
-        # Set the redirect URI in the client configuration
+        # Verify credentials are properly formatted
+        if not client_id.endswith('.apps.googleusercontent.com'):
+            raise ValueError("Invalid Client ID format. Must end with .apps.googleusercontent.com")
+        if not client_secret.startswith('GOCSPX-'):
+            raise ValueError("Invalid Client Secret format. Must start with GOCSPX-")
+            
+        session['oauth_redirect_uri'] = redirect_uri
         google.client_kwargs['redirect_uri'] = redirect_uri
         
+        print("Initiating authorization redirect...")
         return google.authorize_redirect(redirect_uri)
     except Exception as e:
-        flash(f'Failed to initiate Google login: {str(e)}', 'error')
-        print(f"Google login error: {str(e)}")
+        error_msg = f"Google login error: {str(e)}"
+        print(error_msg)
+        flash(error_msg, 'error')
         return redirect(url_for('login'))
 
 
@@ -360,4 +383,4 @@ def reset_session():
 
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, port=8080)
