@@ -1,6 +1,6 @@
 import os
 import uuid
-from flask import Flask, request, render_template, jsonify
+from flask import Flask, request, render_template, jsonify, url_for, redirect, session, flash
 import PyPDF2
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -8,15 +8,66 @@ from langchain.vectorstores import FAISS
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 import google.generativeai as genai
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from authlib.integrations.flask_client import OAuth
+import json
+import secrets
 
 app = Flask(__name__)
 
-# Configuration
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-if not GOOGLE_API_KEY:
-    raise ValueError("GOOGLE_API_KEY environment variable is not set")
+# Set a fixed secret key - in production, this should be a secure environment variable
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'your-secret-key-here')
 
-genai.configure(api_key=GOOGLE_API_KEY)
+# Check for required environment variables
+required_env_vars = {
+    'GOOGLE_CLIENT_ID': os.environ.get('GOOGLE_CLIENT_ID'),
+    'GOOGLE_CLIENT_SECRET': os.environ.get('GOOGLE_CLIENT_SECRET'),
+    'GOOGLE_API_KEY': os.environ.get('GOOGLE_API_KEY')
+}
+
+missing_vars = [var for var, value in required_env_vars.items() if not value]
+if missing_vars:
+    raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+
+# OAuth Setup
+oauth = OAuth(app)
+google = oauth.register(
+    name='google',
+    client_id=required_env_vars['GOOGLE_CLIENT_ID'],
+    client_secret=required_env_vars['GOOGLE_CLIENT_SECRET'],
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={
+        'scope': 'openid email profile',
+        'prompt': 'select_account'
+    }
+)
+
+# Login manager setup
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+login_manager.login_message = 'Please log in to access this page.'
+
+# User class for Flask-Login
+class User(UserMixin):
+    def __init__(self, user_id, email, name):
+        self.id = user_id
+        self.email = email
+        self.name = name
+
+# User loader for Flask-Login
+@login_manager.user_loader
+def load_user(user_id):
+    if 'user' in session and session['user']['id'] == user_id:
+        return User(
+            session['user']['id'],
+            session['user']['email'],
+            session['user']['name']
+        )
+    return None
+
+# Configuration
+genai.configure(api_key=required_env_vars['GOOGLE_API_KEY'])
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
@@ -60,7 +111,7 @@ def create_conversation_chain(vector_db):
     """Create a conversational retrieval chain."""
     # Initialize the language model
     llm = ChatGoogleGenerativeAI(
-        model="models/gemini-2.0-flash-",  # Updated model name
+        model="gemini-1.5-flash",  # Corrected model name
         temperature=0.3,
         convert_system_message_to_human=True
     )
@@ -93,10 +144,92 @@ def save_uploaded_file(file):
 @app.route('/')
 def index():
     """Render the home page."""
-    return render_template('index.html')
+    if current_user.is_authenticated:
+        return render_template('index.html')
+    return redirect(url_for('login'))
+
+
+@app.route('/login')
+def login():
+    """Handle login route."""
+    if current_user.is_authenticated:
+        return redirect(url_for('index'))
+    return render_template('login.html')
+
+
+@app.route('/login/google')
+def google_login():
+    """Initiate Google OAuth login."""
+    try:
+        # Generate and store nonce
+        nonce = secrets.token_urlsafe(16)
+        session['nonce'] = nonce
+        
+        redirect_uri = url_for('google_authorize', _external=True)
+        return google.authorize_redirect(
+            redirect_uri=redirect_uri,
+            nonce=nonce
+        )
+    except Exception as e:
+        flash(f'Failed to initiate Google login: {str(e)}', 'error')
+        print(f"Google login error: {str(e)}")
+        return redirect(url_for('login'))
+
+
+@app.route('/login/google/authorize')
+def google_authorize():
+    """Handle Google OAuth callback."""
+    try:
+        token = google.authorize_access_token()
+        
+        # Get the nonce from session
+        nonce = session.pop('nonce', None)
+        if not nonce:
+            raise ValueError("Missing nonce in session")
+        
+        # Get user info from ID token
+        userinfo = token.get('userinfo')
+        if not userinfo:
+            # If userinfo is not in token, get it from ID token
+            resp = google.get('userinfo')
+            userinfo = resp.json()
+        
+        # Verify the user's email is present
+        if 'email' not in userinfo:
+            raise ValueError("Email not found in user info")
+        
+        user = User(
+            userinfo.get('sub', str(uuid.uuid4())),  # Fallback to generated ID if sub is missing
+            userinfo['email'],
+            userinfo.get('name', userinfo['email'].split('@')[0])  # Fallback to email username if name is missing
+        )
+        
+        session['user'] = {
+            'id': user.id,
+            'email': user.email,
+            'name': user.name
+        }
+        
+        login_user(user)
+        flash('Successfully logged in!', 'success')
+        return redirect(url_for('index'))
+    except Exception as e:
+        flash(f'Failed to complete Google authentication: {str(e)}', 'error')
+        print(f"Google auth error: {str(e)}")
+        return redirect(url_for('login'))
+
+
+@app.route('/logout')
+@login_required
+def logout():
+    """Handle logout."""
+    logout_user()
+    session.pop('user', None)
+    return redirect(url_for('login'))
 
 
 @app.route('/upload', methods=['POST'])
+@login_required
 def upload_file():
     """Handle multiple file uploads and process them."""
     global conversation_chain, uploaded_files
@@ -153,6 +286,7 @@ def upload_file():
 
 
 @app.route('/files', methods=['GET'])
+@login_required
 def list_files():
     """Return a list of all uploaded files."""
     global uploaded_files
@@ -160,6 +294,7 @@ def list_files():
 
 
 @app.route('/ask', methods=['POST'])
+@login_required
 def ask_question():
     """Handle questions about the uploaded PDFs."""
     global conversation_chain
@@ -205,6 +340,7 @@ def ask_question():
 
 
 @app.route('/reset', methods=['POST'])
+@login_required
 def reset_session():
     """Reset the current session, optionally deleting uploaded files."""
     global conversation_chain, uploaded_files
