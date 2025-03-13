@@ -35,11 +35,20 @@ google = oauth.register(
     name='google',
     client_id=required_env_vars['GOOGLE_CLIENT_ID'],
     client_secret=required_env_vars['GOOGLE_CLIENT_SECRET'],
-    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    access_token_url='https://oauth2.googleapis.com/token',
+    access_token_params=None,
+    authorize_url='https://accounts.google.com/o/oauth2/v2/auth',
+    authorize_params={
+        'prompt': 'select_account',
+        'access_type': 'offline',
+        'response_type': 'code'
+    },
+    api_base_url='https://www.googleapis.com/oauth2/v3/',
     client_kwargs={
         'scope': 'openid email profile',
-        'prompt': 'select_account'
-    }
+        'redirect_uri': None  # Will be set dynamically
+    },
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration'
 )
 
 # Login manager setup
@@ -161,15 +170,14 @@ def login():
 def google_login():
     """Initiate Google OAuth login."""
     try:
-        # Generate and store nonce
-        nonce = secrets.token_urlsafe(16)
-        session['nonce'] = nonce
-        
         redirect_uri = url_for('google_authorize', _external=True)
-        return google.authorize_redirect(
-            redirect_uri=redirect_uri,
-            nonce=nonce
-        )
+        print(f"Redirect URI: {redirect_uri}")  # Debug print
+        session['oauth_redirect_uri'] = redirect_uri
+        
+        # Set the redirect URI in the client configuration
+        google.client_kwargs['redirect_uri'] = redirect_uri
+        
+        return google.authorize_redirect(redirect_uri)
     except Exception as e:
         flash(f'Failed to initiate Google login: {str(e)}', 'error')
         print(f"Google login error: {str(e)}")
@@ -181,27 +189,16 @@ def google_authorize():
     """Handle Google OAuth callback."""
     try:
         token = google.authorize_access_token()
+        resp = google.get('userinfo')
+        userinfo = resp.json()
         
-        # Get the nonce from session
-        nonce = session.pop('nonce', None)
-        if not nonce:
-            raise ValueError("Missing nonce in session")
-        
-        # Get user info from ID token
-        userinfo = token.get('userinfo')
-        if not userinfo:
-            # If userinfo is not in token, get it from ID token
-            resp = google.get('userinfo')
-            userinfo = resp.json()
-        
-        # Verify the user's email is present
         if 'email' not in userinfo:
             raise ValueError("Email not found in user info")
         
         user = User(
-            userinfo.get('sub', str(uuid.uuid4())),  # Fallback to generated ID if sub is missing
+            userinfo.get('sub', str(uuid.uuid4())),
             userinfo['email'],
-            userinfo.get('name', userinfo['email'].split('@')[0])  # Fallback to email username if name is missing
+            userinfo.get('name', userinfo['email'].split('@')[0])
         )
         
         session['user'] = {
